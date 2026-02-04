@@ -60,6 +60,14 @@ def execute_structured_query(df: pd.DataFrame, query: str) -> str:
     Returns:
         Formatted query results
     """
+    # TRY EXPLICIT PATTERN MATCHING FIRST - more reliable than LLM code generation
+    # This handles: actor queries, genre filtering, year ranges, top-N queries
+    result = handle_fallback_query(df, query)
+    if "couldn't process" not in result:
+        return result
+
+    # Only fall back to LLM code generation for complex queries that pattern matching can't handle
+
     # Create LLM for query parsing
     llm = ChatOpenAI(
         model=LLM_MODEL,
@@ -191,6 +199,46 @@ def format_query_result(result: Any, query: str) -> str:
         return str(result)
 
 
+def extract_actor_name(query: str, df: pd.DataFrame) -> list:
+    """Extract actor names from a query by matching against the dataset.
+
+    Args:
+        query: User query
+        df: Movie DataFrame with Star columns
+
+    Returns:
+        List of matched actor names
+    """
+    # Common words to exclude from name detection
+    exclude_words = {
+        "top", "best", "worst", "movies", "films", "movie", "film",
+        "the", "and", "with", "from", "about", "list", "show", "find",
+        "what", "when", "where", "who", "how", "which", "rating",
+        "score", "meta", "imdb", "gross", "comedy", "drama", "action",
+        "horror", "sci-fi", "thriller", "romance", "genre", "year",
+        "before", "after", "between", "above", "below", "over", "under",
+        "lead", "actor", "star", "main", "role", "any", "all", "higher",
+        "lower", "million", "billion"
+    }
+
+    # Get all unique actor names from dataset
+    all_actors = set()
+    for col in ['Star1', 'Star2', 'Star3', 'Star4']:
+        all_actors.update(df[col].dropna().unique())
+
+    # Find actor names mentioned in query
+    found_actors = []
+    query_upper = query  # Keep original case for matching
+
+    for actor in all_actors:
+        if actor and len(actor) > 3:  # Skip very short names
+            # Check if actor name appears in query (case-insensitive)
+            if actor.lower() in query.lower():
+                found_actors.append(actor)
+
+    return found_actors
+
+
 def handle_fallback_query(df: pd.DataFrame, query: str) -> str:
     """Handle common query patterns with direct logic.
 
@@ -213,6 +261,43 @@ def handle_fallback_query(df: pd.DataFrame, query: str) -> str:
                 year = row.get("Released_Year_cleaned", row.get("Released_Year"))
                 return f"**{row['Series_Title']}** was released in {year}."
 
+    # ACTOR QUERY HANDLING - Check for actor names first
+    actor_names = extract_actor_name(query, df)
+    if actor_names:
+        actor_name = actor_names[0]  # Use first detected actor
+        # Check if lead role only specified
+        lead_only = "star1" in query_lower or "lead" in query_lower or "main role" in query_lower
+
+        if lead_only:
+            filtered_df = filtered_df[filtered_df['Star1'].str.contains(actor_name, case=False, na=False)]
+        else:
+            # Search all star columns
+            filtered_df = filtered_df[
+                filtered_df['Star1'].str.contains(actor_name, case=False, na=False) |
+                filtered_df['Star2'].str.contains(actor_name, case=False, na=False) |
+                filtered_df['Star3'].str.contains(actor_name, case=False, na=False) |
+                filtered_df['Star4'].str.contains(actor_name, case=False, na=False)
+            ]
+
+        # Apply additional filters for actor queries
+        # Rating filter
+        rating_match = re.search(r'rating\s*(?:of|above|over|>=?)?\s*(\d+(?:\.\d+)?)', query_lower)
+        if rating_match:
+            min_rating = float(rating_match.group(1))
+            filtered_df = filtered_df[filtered_df['IMDB_Rating'] >= min_rating]
+
+        # Gross filter
+        gross_match = re.search(r'gross(?:ed)?\s*(?:over|above|>=?)?\s*\$?(\d+)\s*[mM]', query_lower)
+        if gross_match:
+            min_gross = int(gross_match.group(1)) * 1_000_000
+            filtered_df = filtered_df.dropna(subset=['Gross_cleaned'])
+            filtered_df = filtered_df[filtered_df['Gross_cleaned'] >= min_gross]
+
+        if len(filtered_df) > 0:
+            return format_query_result(filtered_df.nlargest(10, 'IMDB_Rating'), query)
+        else:
+            return f"No movies found for {actor_name} matching your criteria."
+
     # Extract number for "top N" queries
     n_match = re.search(r"top\s+(\d+)", query_lower)
     n = int(n_match.group(1)) if n_match else 10
@@ -225,8 +310,8 @@ def handle_fallback_query(df: pd.DataFrame, query: str) -> str:
             filtered_df = filtered_df[filtered_df["Genre"].str.contains(genre, case=False, na=False)]
             break
 
-    # Year range filter (e.g., "between 2010-2020" or "2010 to 2020")
-    year_range_match = re.search(r"(\d{4})\s*[-to]+\s*(\d{4})", query_lower)
+    # Year range filter (e.g., "between 2010-2020", "2010 to 2020", "2010 and 2020")
+    year_range_match = re.search(r"(\d{4})\s*(?:-|to|and)\s*(\d{4})", query_lower)
     if year_range_match:
         start_year = int(year_range_match.group(1))
         end_year = int(year_range_match.group(2))
