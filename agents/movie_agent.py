@@ -15,6 +15,7 @@ from tools.structured_query import StructuredQueryTool
 from tools.semantic_search import SemanticSearchTool
 from tools.summarizer import SummarizerTool
 from tools.recommender import RecommenderTool
+from tools.aggregation import AggregationTool
 
 
 class MovieAgent:
@@ -35,7 +36,8 @@ class MovieAgent:
             "structured_movie_query": StructuredQueryTool(df=df),
             "semantic_movie_search": SemanticSearchTool(collection=collection),
             "movie_summarizer": SummarizerTool(df=df),
-            "movie_recommender": RecommenderTool(df=df, collection=collection)
+            "movie_recommender": RecommenderTool(df=df, collection=collection),
+            "movie_aggregation": AggregationTool(df=df)
         }
 
         # Create LLM with tool binding
@@ -72,6 +74,39 @@ class MovieAgent:
             except Exception as e:
                 return f"Error executing {tool_name}: {str(e)}"
         return f"Unknown tool: {tool_name}"
+
+    def _validate_response(self, response: str, tool_results: list) -> str:
+        """Ensure response is grounded in tool results, not hallucinated.
+
+        Args:
+            response: The LLM's response
+            tool_results: List of results from tool executions
+
+        Returns:
+            Original response if valid, or error message if hallucination detected
+        """
+        import re
+
+        # If tools were called successfully, trust the response
+        if tool_results and any(
+            "Error" not in r and "couldn't" not in r.lower() and "No movies found" not in r and "No " not in r[:20]
+            for r in tool_results
+        ):
+            return response
+
+        # If no successful tool results, check for hallucination patterns
+        hallucination_patterns = [
+            r'\$[\d,]+\s*[BMK]',  # Dollar amounts like $2.8B, $500M
+            r'\$[\d,]{6,}',  # Large dollar amounts like $500,000,000
+            r'grossed?\s+(over\s+)?\$',  # "grossed $X" claims
+            r'earned\s+(over\s+)?\$',  # "earned $X" claims
+        ]
+
+        for pattern in hallucination_patterns:
+            if re.search(pattern, response, re.IGNORECASE):
+                return "I couldn't find data matching your criteria in the IMDB Top 1000 dataset. The query may be too specific or the data may not exist in this dataset. Please try adjusting your filters or rephrasing your question."
+
+        return response
 
     def check_for_clarification(self, query: str) -> Optional[dict]:
         """Check if the query needs clarification.
@@ -181,6 +216,7 @@ class MovieAgent:
         # Execute agent with tool calling loop
         try:
             messages = self._build_messages(query)
+            all_tool_results = []  # Track all tool results for validation
 
             # Agentic loop - allow multiple tool calls
             for _ in range(MAX_ITERATIONS):
@@ -193,8 +229,12 @@ class MovieAgent:
                     for tool_call in response.tool_calls:
                         tool_name = tool_call["name"]
                         tool_args = tool_call["args"]
+                        print(f"[DEBUG] Tool called: {tool_name}")
+                        print(f"[DEBUG] Tool args: {tool_args}")
                         result = self._execute_tool(tool_name, tool_args)
+                        print(f"[DEBUG] Tool result preview: {result[:200]}..." if len(result) > 200 else f"[DEBUG] Tool result: {result}")
                         tool_results.append(f"Tool '{tool_name}' result:\n{result}")
+                        all_tool_results.append(result)  # Track raw results
 
                     # Add tool results to messages and continue
                     messages.append(response)
@@ -205,7 +245,12 @@ class MovieAgent:
                         ))
                 else:
                     # No more tool calls, return the final response
+                    print(f"[DEBUG] No more tool calls. Tools used in this query: {len(all_tool_results)}")
                     final_response = response.content
+
+                    # Validate response to prevent hallucination
+                    final_response = self._validate_response(final_response, all_tool_results)
+
                     # Update chat history
                     self.chat_history.append(HumanMessage(content=query))
                     self.chat_history.append(AIMessage(content=final_response))
@@ -218,7 +263,7 @@ class MovieAgent:
 
     def clear_memory(self):
         """Clear conversation memory."""
-        self.memory.clear()
+        self.chat_history.clear()
         self.pending_clarification = None
 
 
